@@ -13,11 +13,13 @@ from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 from social_core.exceptions import (
+    AuthConfigurationError,
     AuthInputError,
     AuthPolicyError,
     AuthResponseError,
     AuthSessionError,
 )
+from social_core.strategy import BaseStrategy
 from social_core.tests.models import TestUserSocialAuth, User
 
 from .base import BaseBackendTest
@@ -94,7 +96,8 @@ class SAMLProtocolTest(BaseBackendTest):
     def post(self, node, relay_state: str | None = '{"idp":"idp"}'):
         self.strategy.request_data().clear()
         values = {
-            "SAMLResponse": saml.encode(node) if not isinstance(node, str) else node
+            "SAMLResponse": saml.encode(node) if not isinstance(node, str) else node,
+            self.backend.BROWSER_RETURN_FIELD: "1",
         }
         if relay_state is not None:
             values["RelayState"] = relay_state
@@ -405,9 +408,11 @@ class SAMLProtocolTest(BaseBackendTest):
                 subject.insert(1, confirmation)
                 self.rejected(saml.signed_response(node), exception=AuthSessionError)
 
-    def test_unsolicited_login_and_account_linking(self):
+    def test_unsolicited_login_requires_explicit_opt_in(self):
         node = saml.signed_response(saml.response(None))
         self.rejected(node, user=User("existing"), exception=AuthSessionError)
+        self.rejected(node, exception=AuthSessionError)
+        self.strategy.set_settings({"SOCIAL_AUTH_SAML_ALLOW_IDP_INITIATED": True})
         self.complete(node)
         self.assertEqual(self.strategy.session_get(self.key), "request-id")
         self.strategy.session_pop(self.key)
@@ -431,45 +436,85 @@ class SAMLProtocolTest(BaseBackendTest):
             exception=AuthResponseError,
         )
 
-    def test_restored_session_is_checked_after_signature(self):
+    def test_relay_state_session_id_cannot_replace_browser_request(self):
         relay = json.dumps(
             {"idp": "idp", self.strategy.SESSION_SAVE_KEY: "saved-session"}
         )
-        self.rejected(saml.signed_response(identity="untrusted"), relay_state=relay)
-        self.strategy.session_pop(self.key)
-        events = []
-
-        def restore(session_id, kwargs):
-            self.assertEqual(session_id, "saved-session")
-            events.append("restore")
-            self.strategy.session_set(self.key, "request-id")
-
-        with patch.object(self.strategy, "restore_session", restore):
+        for browser_request in (None, "victim-request"):
+            with self.subTest(browser_request=browser_request):
+                self.strategy.session_set(self.key, browser_request)
+                self.rejected(
+                    saml.signed_response(),
+                    relay_state=relay,
+                    exception=AuthSessionError
+                    if browser_request is None
+                    else AuthResponseError,
+                )
+                self.assertEqual(self.strategy.session_get(self.key), browser_request)
+        self.strategy.session_set(self.key, "request-id")
+        with patch.object(self.strategy, "restore_session") as restore:
             self.complete(saml.signed_response(), relay_state=relay)
-        self.assertEqual(events, ["restore"])
+        restore.assert_not_called()
         self.assertIsNone(self.strategy.session_get(self.key))
 
-    def test_restored_session_mismatched_request(self):
+    def test_browser_return_preserves_response_and_requires_browser_request(self):
         relay = json.dumps(
-            {"idp": "idp", self.strategy.SESSION_SAVE_KEY: "saved-session"}
+            {"idp": "idp", self.strategy.SESSION_SAVE_KEY: "attacker-session"}
         )
-        self.post(saml.signed_response(), relay)
-        for restored_id in (None, "wrong-request"):
-            with self.subTest(restored_id=restored_id):
+        saml_response = saml.encode(saml.signed_response())
+        self.strategy.set_request_data(
+            {"SAMLResponse": saml_response, "RelayState": relay}, self.backend
+        )
+        with patch.object(self.strategy, "authenticate") as authenticate:
+            page = self.backend.complete()
+        authenticate.assert_not_called()
+        self.assertEqual(self.strategy.session_get(self.key), "request-id")
+        self.assertIn('name="SAMLResponse"', page.content)
+        self.assertIn(saml_response, page.content)
+        self.assertIn('name="psa_saml_browser_return"', page.content)
+        self.assertIn("no-store", page.headers["Cache-Control"])
+        self.assertEqual(page.headers["X-Frame-Options"], "DENY")
+        self.assertEqual(page.headers["Referrer-Policy"], "no-referrer")
+        self.assertIn("form-action 'self'", page.headers["Content-Security-Policy"])
 
-                def restore(session_id, kwargs, restored_id=restored_id):
-                    self.strategy.session_set(self.key, restored_id)
+        self.complete(
+            saml_response,
+            relay_state=relay,
+        )
+        self.assertIsNone(self.strategy.session_get(self.key))
+        self.rejected(
+            saml_response,
+            relay_state=relay,
+            exception=AuthSessionError,
+        )
 
-                with (
-                    patch.object(self.strategy, "restore_session", restore),
-                    patch.object(self.strategy, "authenticate") as authenticate,
-                    self.assertRaises(AuthSessionError),
-                ):
-                    self.backend.complete()
-                authenticate.assert_not_called()
-                self.assertEqual(self.strategy.session_get(self.key), restored_id)
+    def test_browser_return_escapes_untrusted_values(self):
+        self.strategy.set_request_data(
+            {
+                "SAMLResponse": '"><script>alert(1)</script>',
+                "RelayState": '"><img src=x onerror=alert(1)>',
+            },
+            self.backend,
+        )
+        page = self.backend.complete()
+        self.assertIn("&lt;script&gt;alert(1)&lt;/script&gt;", page.content)
+        self.assertIn("&lt;img src=x onerror=alert(1)&gt;", page.content)
+        self.assertNotIn("<script>alert(1)</script>", page.content)
+
+    def test_browser_return_requires_response_headers(self):
+        self.strategy.set_request_data({"SAMLResponse": "irrelevant"}, self.backend)
+        with (
+            patch.object(
+                type(self.strategy), "html_with_headers", BaseStrategy.html_with_headers
+            ),
+            self.assertRaises(AuthConfigurationError) as caught,
+        ):
+            self.backend.complete()
+        self.assertEqual(caught.exception.code, "unsupported_feature")
+        self.assertEqual(caught.exception.stage, "callback")
 
     def test_relay_state_variants_and_single_idp(self):
+        self.strategy.set_settings({"SOCIAL_AUTH_SAML_ALLOW_IDP_INITIATED": True})
         for relay in ("idp", '{"idp":"idp","next":"/after"}'):
             with self.subTest(relay=relay):
                 self.complete(saml.signed_response(saml.response(None)), relay)
@@ -607,16 +652,15 @@ class SAMLProtocolTest(BaseBackendTest):
         )
         self.assertEqual(query["SigAlg"], saml.SHA256)
 
-    def test_configured_signature_algorithm_and_session_relay(self):
+    def test_configured_signature_algorithm_without_session_relay(self):
         self.security(authnRequestsSigned=True, signatureAlgorithm=saml.SHA512)
         self.strategy.set_request_data({"idp": "idp"}, self.backend)
-        with patch.object(self.strategy, "get_session_id", return_value="saved"):
-            node, query = saml.decode_redirect(self.backend.auth_url())
+        node, query = saml.decode_redirect(self.backend.auth_url())
         saml.verify_redirect(query)
         self.assertEqual(query["SigAlg"], saml.SHA512)
         self.assertEqual(self.strategy.session_get(self.key), node.get("ID"))
-        self.assertEqual(
-            json.loads(query["RelayState"])[self.strategy.SESSION_SAVE_KEY], "saved"
+        self.assertNotIn(
+            self.strategy.SESSION_SAVE_KEY, json.loads(query["RelayState"])
         )
 
     def test_signed_metadata(self):

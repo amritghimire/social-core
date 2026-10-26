@@ -303,6 +303,17 @@ class BaseStrategy:
         """Return HTTP response with given content"""
         raise NotImplementedError("Implement in subclass")
 
+    def html_with_headers(
+        self, content: str, headers: Mapping[str, str]
+    ) -> HttpResponseProtocol:
+        """Return HTML with required headers; integrations must implement this."""
+        raise AuthConfigurationError(
+            None,
+            "Strategy does not support HTML response headers",
+            code="unsupported_feature",
+            stage="callback",
+        )
+
     def request_data(self, merge: bool = True) -> dict[str, Any]:
         """Return effective pipeline data, or data from the current request.
 
